@@ -238,10 +238,6 @@ func main() {
 		return
 	}
 
-	if SystemConfig.PurgeChunk == 0 {
-		SystemConfig.PurgeChunk = -1
-	}
-
 	// start the worker loop
 	log.WithFields(logrus.Fields{
 		"prefix": mainPrefix,
