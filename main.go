@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"os"
@@ -29,14 +31,15 @@ var UptimePump pumps.MongoPump
 var log = logger.GetLogger()
 
 var mainPrefix = "main"
-var buildDemoData string
 
 var (
-	help      = kingpin.CommandLine.HelpFlag.Short('h')
-	conf      = kingpin.Flag("conf", "path to the config file").Short('c').Default("pump.conf").String()
-	demoMode  = kingpin.Flag("demo", "pass orgID string to generate demo data").Default("").String()
-	debugMode = kingpin.Flag("debug", "enable debug mode").Bool()
-	version   = kingpin.Version(VERSION)
+	help               = kingpin.CommandLine.HelpFlag.Short('h')
+	conf               = kingpin.Flag("conf", "path to the config file").Short('c').Default("pump.conf").String()
+	demoMode           = kingpin.Flag("demo", "pass orgID string to generate demo data").Default("").String()
+	demoApiMode        = kingpin.Flag("demo-api", "pass apiID string to generate demo data").Default("").String()
+	demoApiVersionMode = kingpin.Flag("demo-api-version", "pass apiID string to generate demo data").Default("").String()
+	debugMode          = kingpin.Flag("debug", "enable debug mode").Bool()
+	version            = kingpin.Version(VERSION)
 )
 
 func init() {
@@ -46,11 +49,10 @@ func init() {
 
 	log.Formatter = new(prefixed.TextFormatter)
 
-	buildDemoData = *demoMode
 	envDemo := os.Getenv("TYK_PMP_BUILDDEMODATA")
 	if envDemo != "" {
 		log.Warning("Demo mode active via environemnt variable")
-		buildDemoData = envDemo
+		demoMode = &envDemo
 	}
 
 	log.WithFields(logrus.Fields{
@@ -136,6 +138,7 @@ func initialisePumps() {
 				log.WithFields(logrus.Fields{
 					"prefix": mainPrefix,
 				}).Info("Init Pump: ", thisPmp.GetName())
+				thisPmp.SetTimeout(pmp.Timeout)
 				Pumps[i] = thisPmp
 			}
 		}
@@ -183,7 +186,7 @@ func StartPurgeLoop(secInterval, chunkSize int64) {
 			}
 
 			// Send to pumps
-			writeToPumps(keys, job, startTime)
+			writeToPumps(keys, job, startTime, secInterval)
 
 			job.Timing("purge_time_all", time.Since(startTime).Nanoseconds())
 
@@ -196,23 +199,76 @@ func StartPurgeLoop(secInterval, chunkSize int64) {
 	}
 }
 
-func writeToPumps(keys []interface{}, job *health.Job, startTime time.Time) {
+func writeToPumps(keys []interface{}, job *health.Job, startTime time.Time, purgeDelay int) {
 	// Send to pumps
 	if Pumps != nil {
+		var wg sync.WaitGroup
+		wg.Add(len(Pumps))
 		for _, pmp := range Pumps {
-			log.WithFields(logrus.Fields{
-				"prefix": mainPrefix,
-			}).Debug("Writing to: ", pmp.GetName())
-			pmp.WriteData(keys)
-			if job != nil {
-				job.Timing("purge_time_"+pmp.GetName(), time.Since(startTime).Nanoseconds())
-			}
-
+			go execPumpWriting(&wg, pmp, &keys, purgeDelay, startTime, job)
 		}
+		wg.Wait()
 	} else {
 		log.WithFields(logrus.Fields{
 			"prefix": mainPrefix,
 		}).Warning("No pumps defined!")
+	}
+}
+
+func execPumpWriting(wg *sync.WaitGroup, pmp pumps.Pump, keys *[]interface{}, purgeDelay int, startTime time.Time, job *health.Job) {
+	timer := time.AfterFunc(time.Duration(purgeDelay)*time.Second, func() {
+		if pmp.GetTimeout() == 0 {
+			log.WithFields(logrus.Fields{
+				"prefix": mainPrefix,
+			}).Warning("Pump  ", pmp.GetName(), " is taking more time than the value configured of purge_delay. You should try to set a timeout for this pump.")
+		} else if pmp.GetTimeout() > purgeDelay {
+			log.WithFields(logrus.Fields{
+				"prefix": mainPrefix,
+			}).Warning("Pump  ", pmp.GetName(), " is taking more time than the value configured of purge_delay. You should try lowering the timeout configured for this pump.")
+		}
+	})
+	defer timer.Stop()
+	defer wg.Done()
+	ch := make(chan error, 1)
+	//Load pump timeout
+	timeout := pmp.GetTimeout()
+	var ctx context.Context
+	var cancel context.CancelFunc
+	//Initialize context depending if the pump has a configured timeout
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
+
+	defer cancel()
+
+	go func(ch chan error, ctx context.Context, pmp pumps.Pump, keys *[]interface{}) {
+		ch <- pmp.WriteData(ctx, *keys)
+	}(ch, ctx, pmp, keys)
+
+	select {
+	case err := <-ch:
+		if err != nil {
+			log.WithFields(logrus.Fields{
+				"prefix": mainPrefix,
+			}).Warning("Error Writing to: ", pmp.GetName(), " - Error:", err)
+		}
+	case <-ctx.Done():
+		switch ctx.Err() {
+		case context.Canceled:
+			log.WithFields(logrus.Fields{
+				"prefix": mainPrefix,
+			}).Warning("The writing to ", pmp.GetName(), " have got canceled.")
+		case context.DeadlineExceeded:
+			log.WithFields(logrus.Fields{
+				"prefix": mainPrefix,
+			}).Warning("Timeout Writing to: ", pmp.GetName())
+		}
+	}
+
+	if job != nil {
+		job.Timing("purge_time_"+pmp.GetName(), time.Since(startTime).Nanoseconds())
 	}
 }
 
@@ -229,11 +285,11 @@ func main() {
 	// prime the pumps
 	initialisePumps()
 
-	if buildDemoData != "" {
+	if *demoMode != "" {
 		log.Warning("BUILDING DEMO DATA AND EXITING...")
 		log.Warning("Starting from date: ", time.Now().AddDate(0, 0, -30))
-		demo.DemoInit(buildDemoData)
-		demo.GenerateDemoData(time.Now().AddDate(0, 0, -30), 30, buildDemoData, writeToPumps)
+		demo.DemoInit(*demoMode, *demoApiMode, *demoApiVersionMode)
+		demo.GenerateDemoData(time.Now().AddDate(0, 0, -30), 30, *demoMode, writeToPumps)
 
 		return
 	}
